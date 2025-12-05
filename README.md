@@ -30,7 +30,7 @@ Dado una URL de un directorio de staff, extraer de forma automatizada:
 |------------|-----------|
 | **Python 3.8+** | Lenguaje base del proyecto |
 | **crawl4ai** | Libreria de crawling con soporte para LLM |
-| **OpenAI API** | Extraccion inteligente de datos mediante IA (GPT-5-nano) |
+| **OpenAI API** | Extraccion inteligente de datos mediante IA (GPT-4o-mini) |
 | **Pydantic** | Validacion de datos y generacion de schemas |
 | **asyncio** | Operaciones asincronas para crawling eficiente |
 
@@ -60,10 +60,10 @@ python-crawl/
 │  └─────────────────┘  └─────────────────┘                  │
 │                                                             │
 │  ┌──────────────────────────────────────────────────────┐  │
-│  │  LLMExtractionStrategy (OpenAI GPT-5-nano)           │  │
-│  │  - Schema basado en Pydantic (StaffDirectory)        │  │
-│  │  - Chunking automatico para paginas grandes          │  │
-│  │  - Temperatura 0.0 para resultados consistentes      │  │
+│  │  Estrategia Hibrida de Extraccion                    │  │
+│  │  - LLM (GPT-4o-mini) para contenido visible          │  │
+│  │  - Regex para emails embebidos en HTML               │  │
+│  │  - Auto-deteccion del mejor metodo                   │  │
 │  └──────────────────────────────────────────────────────┘  │
 │                                                             │
 │  Metodos:                                                   │
@@ -94,31 +94,69 @@ URL de Staff Directory
          │
          ▼
 ┌─────────────────────┐
-│  LLMExtraction      │
-│  Strategy           │
-│  (OpenAI GPT-5-nano) │
-└─────────────────────┘
-         │
-         ▼
-┌─────────────────────┐
-│  Datos Extraidos    │
-│  - nombre           │
-│  - rol              │
-│  - email            │
-└─────────────────────┘
-         │
-         ▼
-┌─────────────────────┐
-│  CSV Output         │
-│  results/*.csv      │
-└─────────────────────┘
+│  Analisis de        │
+│  Contenido          │──────────────────┐
+└─────────────────────┘                  │
+         │                               │
+         ▼                               ▼
+┌─────────────────────┐    ┌─────────────────────┐
+│  Emails Embebidos?  │    │  Emails Visibles?   │
+│  (mailto:, JSON)    │    │  (en markdown)      │
+└─────────────────────┘    └─────────────────────┘
+         │                               │
+         ▼                               ▼
+┌─────────────────────┐    ┌─────────────────────┐
+│  Extraccion Regex   │    │  Extraccion LLM     │
+│  (rapida, precisa)  │    │  (GPT-4o-mini)      │
+└─────────────────────┘    └─────────────────────┘
+         │                               │
+         └───────────────┬───────────────┘
+                         ▼
+              ┌─────────────────────┐
+              │  Datos Extraidos    │
+              │  - nombre           │
+              │  - rol              │
+              │  - email            │
+              └─────────────────────┘
+                         │
+                         ▼
+              ┌─────────────────────┐
+              │  CSV Output         │
+              │  results/*.csv      │
+              └─────────────────────┘
 ```
+
+## Estrategia de Extraccion Hibrida
+
+El crawler utiliza una estrategia hibrida que selecciona automaticamente el mejor metodo:
+
+### 1. Extraccion por Patrones (Regex)
+Usada cuando los emails estan embebidos en el HTML (no visibles directamente):
+- Patrones `mailto:` con nombres en aria-label
+- Estructuras JSON embebidas en atributos
+- Links de email con texto adyacente
+
+**Ventajas**: Rapida, precisa, sin costo de API
+
+### 2. Extraccion por LLM (GPT-4o-mini)
+Usada cuando los emails son visibles en el contenido renderizado:
+- Interpreta estructuras HTML variadas
+- Extrae roles y posiciones contextuales
+- Maneja formatos inconsistentes
+
+**Ventajas**: Flexible, entiende contexto
+
+### Auto-Deteccion
+El crawler analiza automaticamente:
+1. Cuenta emails en HTML crudo vs markdown renderizado
+2. Si hay mas emails en HTML que en markdown → usa Regex
+3. Si los emails son visibles en markdown → usa LLM
 
 ## Instalacion
 
 ```bash
 # Clonar repositorio
-git clone <repository-url>
+git clone https://github.com/wartofsky/python-crawl.git
 cd python-crawl
 
 # Crear entorno virtual
@@ -178,7 +216,10 @@ asyncio.run(main())
 
 ### Extraccion con Paginacion Automatica
 
-Para directorios con multiples paginas que usan boton "Next/Siguiente":
+El crawler detecta automaticamente dos tipos de paginacion:
+
+#### 1. Paginacion URL-Based (Automatica)
+Detecta patrones como `?page=2`, `?page_no=2`, `?const_page=2` y navega todas las paginas automaticamente.
 
 ```python
 import asyncio
@@ -187,47 +228,71 @@ from staff_crawler import StaffDirectoryCrawler, PaginationConfig
 async def main():
     crawler = StaffDirectoryCrawler(verbose=True)
 
-    # Configuracion por defecto (detecta automaticamente botones comunes)
-    staff = await crawler.extract_with_pagination("https://example.com/staff")
-
-    # O con configuracion personalizada
-    pagination = PaginationConfig(
-        next_button_selector="a.next-page, .pagination .next",  # Selector CSS
-        max_pages=10,  # Limite de paginas
-        wait_timeout=5000  # Timeout en ms
+    # Detecta automaticamente paginacion URL
+    staff = await crawler.extract_with_pagination(
+        "https://example.com/staff",
+        PaginationConfig(max_pages=10)
     )
-    staff = await crawler.extract_with_pagination("https://example.com/staff", pagination)
 
-    # Exportar resultados
     csv_path = crawler.to_csv(staff)
     print(f"Exportado: {csv_path}")
 
 asyncio.run(main())
 ```
 
-#### Selectores por Defecto
+#### 2. Paginacion JS-Based (Click en boton)
+Para paginas que usan JavaScript para cargar contenido:
 
-El crawler detecta automaticamente estos patrones de botones:
+```python
+pagination = PaginationConfig(
+    next_button_selector="a.next-page, .pagination .next",
+    max_pages=10,
+    wait_timeout=5000  # ms
+)
+staff = await crawler.extract_with_pagination(url, pagination)
+```
+
+#### Selectores de Paginacion por Defecto
+
+El crawler detecta automaticamente estos patrones:
+
+**URL-Based:**
+- `?page=N`, `?page_no=N`, `?p=N`, `?const_page=N`
+
+**JS-Based (botones):**
+- `[aria-label='Next Page']`, `li.next a`
 - `a:has-text('Next')`, `a:has-text('Siguiente')`
-- `a.next`, `.next a`
-- `[rel='next']`
-- `a[aria-label*='next']`
-- `.pagination a:last-child`
+- `a.next`, `.next a`, `[rel='next']`
+- `a[aria-label*='next']`, `.pagination a:last-child`
 
-### Resultado Esperado
+## URLs Probadas
+
+| URL | Tipo | Paginas | Staff | Emails | Estrategia |
+|-----|------|---------|-------|--------|------------|
+| generalstanford.nn.k12.va.us/faculty.html | Simple | 1 | 62 | 62 | Regex |
+| aacps.org/o/marleyes/page/faculty-staff | Accordions | 1 | 78 | 78 | Regex |
+| baltimorecityschools.org/o/ruhrah/staff | URL pagination | 8 | 157 | 140 | Hibrida |
+| ovs.onslow.k12.nc.us/directory | URL pagination | 3 | 48 | 48 | LLM |
+
+## Resultado Esperado
 
 ```
-Extrayendo informacion de staff desde: https://example.com/staff
+Extrayendo desde: https://example.com/staff
 --------------------------------------------------
-Se encontraron 45 miembros del staff.
+Pagina 1: Cargando https://example.com/staff
+Detectada paginacion URL (3 paginas)
+Extrayendo 3 paginas...
+Tipo de contenido detectado: visible (16 emails)
+Usando extraccion LLM...
+
+Total: 48 miembros extraidos de 3 pagina(s)
+
+Primeros 5:
+  John Doe | Principal | john.doe@example.com
+  Jane Smith | Teacher | jane.smith@example.com
+  ...
 
 Datos exportados a: results/staff_20241205_143022.csv
-
-Preview (primeros 5):
---------------------------------------------------
-  John Doe | CEO | john@example.com
-  Jane Smith | CTO | jane@example.com
-  ...
 ```
 
 ## Requisitos del Sistema
@@ -243,13 +308,17 @@ Preview (primeros 5):
 - [x] Investigacion de crawl4ai
 - [x] Estructura del proyecto
 - [x] Implementacion del crawler base
-- [x] Extraccion con LLM (GPT-5-nano)
+- [x] Extraccion con LLM (GPT-4o-mini)
 - [x] Exportacion a CSV
 - [x] Manejo de multiples URLs (extract_many)
-- [x] Paginacion automatica (extract_with_pagination)
+- [x] Paginacion automatica URL-based
+- [x] Paginacion automatica JS-based
+- [x] Estrategia hibrida (LLM + Regex)
+- [x] Auto-deteccion de tipo de contenido
+- [x] Soporte para emails en aria-label
 - [ ] Tests unitarios
 - [ ] Manejo avanzado de errores
-- [ ] Documentacion de API
+- [ ] Rate limiting configurable
 
 ## Dependencias
 
@@ -258,6 +327,50 @@ crawl4ai>=0.4.2
 openai>=1.0.0
 python-dotenv>=1.0.0
 pydantic>=2.0.0
+```
+
+## API Reference
+
+### StaffDirectoryCrawler
+
+```python
+class StaffDirectoryCrawler:
+    def __init__(
+        self,
+        provider: str = "openai/gpt-4o-mini",
+        api_token: Optional[str] = None,  # Default: OPENAI_API_KEY env
+        headless: bool = True,
+        verbose: bool = False
+    )
+```
+
+#### Metodos
+
+| Metodo | Descripcion |
+|--------|-------------|
+| `extract(url)` | Extrae staff de una URL |
+| `extract_many(urls)` | Extrae staff de multiples URLs en paralelo |
+| `extract_with_pagination(url, config)` | Extrae con paginacion automatica |
+| `to_csv(staff, filename)` | Exporta a CSV |
+
+### PaginationConfig
+
+```python
+@dataclass
+class PaginationConfig:
+    next_button_selector: str = "..."  # Selectores CSS para boton Next
+    max_pages: int = 10                 # Limite de paginas
+    wait_timeout: int = 5000            # Timeout en ms
+    content_selector: str = "body"      # Selector para detectar cambio
+```
+
+### StaffMember
+
+```python
+class StaffMember(BaseModel):
+    name: str                    # Nombre completo
+    role: Optional[str] = None   # Cargo/posicion
+    email: Optional[str] = None  # Email
 ```
 
 ---

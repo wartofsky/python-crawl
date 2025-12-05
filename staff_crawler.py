@@ -322,6 +322,7 @@ class StaffDirectoryCrawler:
         patterns = [
             r'href=["\']([^"\']*[?&]page[_]?(?:no)?=(\d+)[^"\']*)["\']',
             r'href=["\']([^"\']*[?&]p=(\d+)[^"\']*)["\']',
+            r'href=["\']([^"\']*[?&]const_page=(\d+)[^"\']*)["\']',  # Finalsite CMS
         ]
 
         page_urls = {}
@@ -330,6 +331,8 @@ class StaffDirectoryCrawler:
             matches = re.findall(pattern, html, re.IGNORECASE)
             for match in matches:
                 href, page_num = match
+                # Limpiar HTML entities
+                href = href.replace('&amp;', '&')
                 page_num = int(page_num)
                 full_url = urljoin(base_url, href)
                 page_urls[page_num] = full_url
@@ -356,7 +359,7 @@ class StaffDirectoryCrawler:
             else:
                 # Intentar construir la URL basada en el patron
                 query = parse_qs(parsed.query)
-                for key in ['page', 'page_no', 'p']:
+                for key in ['page', 'page_no', 'p', 'const_page']:
                     if key in query:
                         query[key] = [str(page)]
                         break
@@ -551,6 +554,16 @@ class StaffDirectoryCrawler:
                     if not members:
                         if self.verbose:
                             print(f"Pagina {page_num}: Sin nuevos miembros. Finalizando.")
+                        break
+
+                    # Detectar duplicados (misma pagina, no hubo cambio real)
+                    existing_emails = {m.email for m in all_members if m.email}
+                    new_emails = {m.email for m in members if m.email}
+
+                    # Si todos los emails nuevos ya existen, es contenido duplicado
+                    if new_emails and new_emails.issubset(existing_emails):
+                        if self.verbose:
+                            print(f"Pagina {page_num}: Contenido duplicado detectado. Finalizando.")
                         break
 
                     all_members.extend(members)
