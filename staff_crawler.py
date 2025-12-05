@@ -20,7 +20,7 @@ load_dotenv()
 @dataclass
 class PaginationConfig:
     """Configuracion para paginacion automatica."""
-    next_button_selector: str = "a:has-text('Next'), a:has-text('next'), a:has-text('Siguiente'), a.next, .next a, [rel='next'], a[aria-label*='next'], a[aria-label*='Next'], .pagination a:last-child"
+    next_button_selector: str = "[aria-label='Next Page'], li.next a, a:has-text('Next'), a:has-text('next'), a:has-text('Siguiente'), a.next, .next a, [rel='next'], a[aria-label*='next'], a[aria-label*='Next'], .pagination a:last-child, .cms-pagination a:last-child"
     max_pages: int = 10
     wait_timeout: int = 5000  # ms
     content_selector: str = "body"  # Selector para detectar cambio de contenido
@@ -31,7 +31,7 @@ class StaffDirectoryCrawler:
 
     def __init__(
         self,
-        provider: str = "openai/gpt-5-nano",
+        provider: str = "openai/gpt-4o-mini",
         api_token: Optional[str] = None,
         headless: bool = True,
         verbose: bool = False
@@ -98,6 +98,18 @@ class StaffDirectoryCrawler:
         members = []
         seen_emails = set()
 
+        # Patron 0: aria-label="Send message to Name at email" (Baltimore CMS style)
+        # Ejemplo: aria-label="Send message to Victoria Blair at VEBlair@bcps.k12.md.us"
+        aria_pattern = r'aria-label="[Ss]end [Mm]essage to ([^"]+?) at ([a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,})"'
+        for match in re.finditer(aria_pattern, html):
+            name, email = match.groups()
+            email = email.strip().lower()
+            name = name.strip()
+
+            if email not in seen_emails and len(name) >= 2:
+                seen_emails.add(email)
+                members.append(StaffMember(name=name, role=None, email=email))
+
         # Patron 1: mailto:email">Nombre</a>, Rol (comun en muchos CMS)
         pattern1 = r'mailto:([a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,})[^>]*>([^<]+)</a>(?:[,\s]*([^<"\\]{2,50}))?'
         for match in re.finditer(pattern1, html):
@@ -108,7 +120,7 @@ class StaffDirectoryCrawler:
             generic_patterns = ['info@', 'contact@', 'office@', 'admin@', 'school@', 'support@']
             if any(email.startswith(p) for p in generic_patterns):
                 continue
-            # Filtrar si el nombre es igual al email (email generico)
+            # Filtrar si el nombre es igual al email (ya lo tenemos de aria-label)
             if '@' in name:
                 continue
 
@@ -291,6 +303,69 @@ class StaffDirectoryCrawler:
                 print(f"Error al parsear JSON: {e}")
             return []
 
+    def _detect_url_pagination(self, html: str, base_url: str) -> Optional[List[str]]:
+        """
+        Detecta si hay paginacion basada en URL y retorna la lista de URLs.
+
+        Busca patrones como:
+        - href="...?page=2", href="...?page_no=2"
+        - href="...&page=2"
+        - Links numerados de paginacion
+
+        Returns:
+            Lista de URLs de paginacion o None si no se detecta
+        """
+        import re
+        from urllib.parse import urljoin, urlparse, parse_qs, urlencode
+
+        # Patrones comunes de paginacion URL
+        patterns = [
+            r'href=["\']([^"\']*[?&]page[_]?(?:no)?=(\d+)[^"\']*)["\']',
+            r'href=["\']([^"\']*[?&]p=(\d+)[^"\']*)["\']',
+        ]
+
+        page_urls = {}
+
+        for pattern in patterns:
+            matches = re.findall(pattern, html, re.IGNORECASE)
+            for match in matches:
+                href, page_num = match
+                page_num = int(page_num)
+                full_url = urljoin(base_url, href)
+                page_urls[page_num] = full_url
+
+        if not page_urls:
+            return None
+
+        # Encontrar el numero maximo de paginas
+        max_page = max(page_urls.keys())
+
+        if max_page <= 1:
+            return None
+
+        # Generar todas las URLs de 1 a max_page
+        # Usar el patron de la URL encontrada
+        sample_url = page_urls.get(2) or list(page_urls.values())[0]
+        parsed = urlparse(sample_url)
+
+        urls = []
+        for page in range(1, max_page + 1):
+            # Construir URL para cada pagina
+            if page in page_urls:
+                urls.append(page_urls[page])
+            else:
+                # Intentar construir la URL basada en el patron
+                query = parse_qs(parsed.query)
+                for key in ['page', 'page_no', 'p']:
+                    if key in query:
+                        query[key] = [str(page)]
+                        break
+                new_query = urlencode(query, doseq=True)
+                new_url = f"{parsed.scheme}://{parsed.netloc}{parsed.path}?{new_query}"
+                urls.append(new_url)
+
+        return urls
+
     async def extract_with_pagination(
         self,
         url: str,
@@ -298,6 +373,10 @@ class StaffDirectoryCrawler:
     ) -> List[StaffMember]:
         """
         Extrae informacion de staff navegando automaticamente por todas las paginas.
+
+        Soporta dos tipos de paginacion:
+        1. URL-based: ?page=2, ?page_no=2 - navega directamente a cada URL
+        2. JS-based: click en boton Next que carga contenido dinamicamente
 
         Args:
             url: URL inicial del directorio de staff
@@ -357,10 +436,10 @@ class StaffDirectoryCrawler:
 
         async with AsyncWebCrawler(config=self._browser_config) as crawler:
             page_num = 1
+            use_hybrid = None  # Will be determined on first page
 
-            # Primera pagina
+            # Primera pagina - sin LLM para analizar contenido
             initial_config = CrawlerRunConfig(
-                extraction_strategy=extraction_strategy,
                 session_id=session_id,
                 cache_mode=CacheMode.BYPASS,
                 word_count_threshold=10,
@@ -375,35 +454,64 @@ class StaffDirectoryCrawler:
             if not result.success:
                 raise RuntimeError(f"Error al crawlear {url}: {result.error_message}")
 
-            members = self._parse_extracted_content(result.extracted_content)
+            # Detectar si hay paginacion URL-based
+            page_urls = self._detect_url_pagination(result.html, url)
+
+            if page_urls:
+                # Paginacion URL-based: usar extract_many para todas las paginas
+                if self.verbose:
+                    print(f"Detectada paginacion URL ({len(page_urls)} paginas)")
+
+                # Limitar al maximo de paginas configurado
+                urls_to_fetch = page_urls[:config.max_pages]
+
+                if self.verbose:
+                    print(f"Extrayendo {len(urls_to_fetch)} paginas...")
+
+                all_members = await self.extract_many(urls_to_fetch)
+
+                if self.verbose:
+                    print(f"\nTotal: {len(all_members)} miembros extraidos de {len(urls_to_fetch)} pagina(s)")
+
+                return all_members
+
+            # Sin paginacion URL, continuar con paginacion JS-based
+            # Analizar tipo de contenido para decidir estrategia
+            content_type, email_count = self._analyze_content_type(result.html, result.markdown or "")
+            use_hybrid = content_type == "embedded"
+
+            if self.verbose:
+                strategy_name = "regex (emails embebidos)" if use_hybrid else "LLM"
+                print(f"Usando estrategia: {strategy_name}")
+
+            # Extraer con la estrategia apropiada
+            if use_hybrid:
+                members = self._extract_from_html_patterns(result.html)
+            else:
+                # Re-crawl con LLM
+                llm_config = CrawlerRunConfig(
+                    extraction_strategy=extraction_strategy,
+                    session_id=session_id,
+                    cache_mode=CacheMode.BYPASS,
+                    word_count_threshold=10,
+                    excluded_tags=["script", "style", "nav", "footer", "aside"]
+                )
+                llm_result = await crawler.arun(url=url, config=llm_config)
+                members = self._parse_extracted_content(llm_result.extracted_content)
+
             all_members.extend(members)
 
             if self.verbose:
                 print(f"Pagina {page_num}: Encontrados {len(members)} miembros")
 
             # Navegar por paginas siguientes
+            previous_member_count = len(all_members)
+
             while page_num < config.max_pages:
-                # Verificar si hay boton siguiente
-                check_config = CrawlerRunConfig(
-                    session_id=session_id,
-                    js_code=js_has_next,
-                    js_only=True,
-                    cache_mode=CacheMode.BYPASS
-                )
-
-                check_result = await crawler.arun(url=url, config=check_config)
-
-                # Si no hay boton siguiente, terminamos
-                if "true" not in str(check_result.html).lower()[:100]:
-                    if self.verbose:
-                        print("No se encontro boton de siguiente pagina. Finalizando.")
-                    break
-
                 page_num += 1
 
                 # Click en siguiente y esperar cambio
                 next_config = CrawlerRunConfig(
-                    extraction_strategy=extraction_strategy,
                     session_id=session_id,
                     js_code=js_click_next,
                     wait_for=js_wait_for_change,
@@ -424,7 +532,20 @@ class StaffDirectoryCrawler:
                             print(f"Error en pagina {page_num}: {result.error_message}")
                         break
 
-                    members = self._parse_extracted_content(result.extracted_content)
+                    # Extraer con la misma estrategia que la primera pagina
+                    if use_hybrid:
+                        members = self._extract_from_html_patterns(result.html)
+                    else:
+                        # Re-crawl con LLM para esta pagina
+                        llm_config = CrawlerRunConfig(
+                            extraction_strategy=extraction_strategy,
+                            session_id=session_id,
+                            cache_mode=CacheMode.BYPASS,
+                            word_count_threshold=10,
+                            excluded_tags=["script", "style", "nav", "footer", "aside"]
+                        )
+                        llm_result = await crawler.arun(url=url, config=llm_config)
+                        members = self._parse_extracted_content(llm_result.extracted_content)
 
                     # Si no hay nuevos miembros, probablemente llegamos al final
                     if not members:
