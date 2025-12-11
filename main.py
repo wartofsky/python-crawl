@@ -4,7 +4,7 @@ from staff_crawler import StaffDirectoryCrawler, PaginationConfig
 
 async def main():
     # URL del directorio de staff a extraer
-    url = "https://sb.kcs.k12.nc.us/school-info/our-staff"
+    url = "https://bedfordes.bcps.org/staff_directory"
 
     print(f"Extrayendo informacion de staff desde: {url}")
     print("-" * 50)

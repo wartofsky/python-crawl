@@ -8,6 +8,9 @@ class StaffMember(BaseModel):
     role: Optional[str] = Field(default=None, description="Cargo o posición en la organización")
     email: Optional[str] = Field(default=None, description="Email (de mailto:, texto visible, o inferido)")
 
+    class Config:
+        extra = "ignore"  # Ignorar campos extra que el LLM pueda agregar
+
 
 class StaffDirectory(BaseModel):
     """Modelo para el directorio completo de staff."""

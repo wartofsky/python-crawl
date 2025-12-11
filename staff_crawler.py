@@ -157,6 +157,37 @@ class StaffDirectoryCrawler:
                     seen_emails.add(email)
                     members.append(StaffMember(name=name.strip(), role=None, email=email))
 
+        # Patron 3: Finalsite CMS - fsConstituentItem con fsFullName, fsTitles, mailto
+        # <div class="fsConstituentItem">
+        #   <h3 class="fsFullName"><a>Nombre</a></h3>
+        #   <div class="fsTitles">Rol</div>
+        #   <a href="mailto:email">
+        fs_pattern = r'<div[^>]*class="fsConstituentItem"[^>]*>.*?<h3[^>]*class="fsFullName"[^>]*>.*?<a[^>]*>([^<]+)</a>.*?(?:<div[^>]*class="fsTitles"[^>]*>.*?</strong>\s*([^<]*)</div>)?.*?mailto:([a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,})'
+        for match in re.finditer(fs_pattern, html, re.DOTALL | re.IGNORECASE):
+            name, role, email = match.groups()
+            email = email.strip().lower()
+            name = name.strip()
+
+            if email not in seen_emails and len(name) >= 2:
+                seen_emails.add(email)
+                role = role.strip() if role else None
+                members.append(StaffMember(name=name, role=role, email=email))
+
+        # Patron 4: Tabla HTML simple - nombre en una celda, email en celda adyacente
+        # <td>...<span>Dr. Nombre Apellido</span>...</td>
+        # <td>...<span>email@domain.org</span>...</td>
+        table_row_pattern = r'<tr[^>]*>.*?<td[^>]*>.*?(?:<[^>]+>)*\s*([A-Z][a-zA-Z]*\.?\s+[A-Z][a-zA-Z]+(?:\s+[A-Z][a-zA-Z]+)?)\s*(?:<[^>]+>)*.*?</td>\s*<td[^>]*>.*?(?:<[^>]+>)*\s*([a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,})\s*(?:<[^>]+>)*.*?</td>'
+        for match in re.finditer(table_row_pattern, html, re.DOTALL | re.IGNORECASE):
+            name, email = match.groups()
+            email = email.strip().lower()
+            name = name.strip()
+            # Limpiar tags HTML del nombre
+            name = re.sub(r'<[^>]+>', '', name).strip()
+
+            if email not in seen_emails and len(name) >= 2:
+                seen_emails.add(email)
+                members.append(StaffMember(name=name, role=None, email=email))
+
         return members
 
     def _analyze_content_type(self, html: str, markdown: str) -> Tuple[str, int]:
@@ -177,13 +208,15 @@ class StaffDirectoryCrawler:
         else:
             return "llm", max(emails_html, emails_md)
 
-    async def extract(self, url: str) -> List[StaffMember]:
+    async def extract(self, url: str, _skip_pagination_check: bool = False) -> List[StaffMember]:
         """
         Extrae informacion de staff desde una URL.
+        Detecta automaticamente si hay paginacion y la maneja.
         Usa estrategia hibrida: detecta automaticamente si usar LLM o regex.
 
         Args:
             url: URL del directorio de staff
+            _skip_pagination_check: Uso interno - evita recursion infinita
 
         Returns:
             Lista de StaffMember con la informacion extraida
@@ -202,6 +235,15 @@ class StaffDirectoryCrawler:
 
             html = result.html or ""
             markdown = result.markdown.raw_markdown if result.markdown else ""
+
+            # Detectar si hay paginacion (solo si no se ha saltado la verificacion)
+            if not _skip_pagination_check:
+                page_urls = self._detect_url_pagination(html, url)
+                if page_urls and len(page_urls) > 1:
+                    if self.verbose:
+                        print(f"Detectada paginacion ({len(page_urls)} paginas). Usando extract_with_pagination...")
+                    # Usar el metodo de paginacion
+                    return await self.extract_with_pagination(url)
 
             # Analizar tipo de contenido
             content_type, email_count = self._analyze_content_type(html, markdown)
@@ -241,17 +283,23 @@ class StaffDirectoryCrawler:
                 data = json.loads(result.extracted_content)
 
                 # El resultado puede venir en diferentes formatos
+                members_data = []
                 if isinstance(data, list):
-                    if data and isinstance(data[0], dict) and "staff_members" in data[0]:
-                        members_data = data[0].get("staff_members", [])
-                    else:
-                        members_data = data
+                    for item in data:
+                        if isinstance(item, dict):
+                            # Si tiene staff_members, extraer de ahi
+                            if "staff_members" in item:
+                                members_data.extend(item.get("staff_members", []))
+                            # Si tiene name (es un miembro directo)
+                            elif "name" in item:
+                                members_data.append(item)
                 elif isinstance(data, dict):
-                    members_data = data.get("staff_members", [])
-                else:
-                    members_data = []
+                    if "staff_members" in data:
+                        members_data = data.get("staff_members", [])
+                    elif "name" in data:
+                        members_data = [data]
 
-                return [StaffMember(**member) for member in members_data]
+                return [StaffMember(**member) for member in members_data if isinstance(member, dict) and "name" in member]
 
             except json.JSONDecodeError as e:
                 raise RuntimeError(f"Error al parsear respuesta JSON: {e}")
@@ -286,17 +334,24 @@ class StaffDirectoryCrawler:
         try:
             data = json.loads(extracted_content)
 
+            # El resultado puede venir en diferentes formatos
+            members_data = []
             if isinstance(data, list):
-                if data and isinstance(data[0], dict) and "staff_members" in data[0]:
-                    members_data = data[0].get("staff_members", [])
-                else:
-                    members_data = data
+                for item in data:
+                    if isinstance(item, dict):
+                        # Si tiene staff_members, extraer de ahi
+                        if "staff_members" in item:
+                            members_data.extend(item.get("staff_members", []))
+                        # Si tiene name (es un miembro directo)
+                        elif "name" in item:
+                            members_data.append(item)
             elif isinstance(data, dict):
-                members_data = data.get("staff_members", [])
-            else:
-                members_data = []
+                if "staff_members" in data:
+                    members_data = data.get("staff_members", [])
+                elif "name" in data:
+                    members_data = [data]
 
-            return [StaffMember(**member) for member in members_data]
+            return [StaffMember(**member) for member in members_data if isinstance(member, dict) and "name" in member]
 
         except json.JSONDecodeError as e:
             if self.verbose:
@@ -331,8 +386,9 @@ class StaffDirectoryCrawler:
             matches = re.findall(pattern, html, re.IGNORECASE)
             for match in matches:
                 href, page_num = match
-                # Limpiar HTML entities
+                # Limpiar HTML entities y caracteres extra
                 href = href.replace('&amp;', '&')
+                href = href.rstrip('&')  # Quitar & al final
                 page_num = int(page_num)
                 full_url = urljoin(base_url, href)
                 page_urls[page_num] = full_url
@@ -460,8 +516,10 @@ class StaffDirectoryCrawler:
             # Detectar si hay paginacion URL-based
             page_urls = self._detect_url_pagination(result.html, url)
 
+            url_pagination_failed = False
+
             if page_urls:
-                # Paginacion URL-based: usar extract_many para todas las paginas
+                # Paginacion URL-based: extraer secuencialmente con deteccion de duplicados
                 if self.verbose:
                     print(f"Detectada paginacion URL ({len(page_urls)} paginas)")
 
@@ -469,16 +527,202 @@ class StaffDirectoryCrawler:
                 urls_to_fetch = page_urls[:config.max_pages]
 
                 if self.verbose:
-                    print(f"Extrayendo {len(urls_to_fetch)} paginas...")
+                    print(f"Extrayendo hasta {len(urls_to_fetch)} paginas...")
 
-                all_members = await self.extract_many(urls_to_fetch)
+                # Extraer pagina por pagina detectando duplicados
+                seen_emails = set()
+                pages_extracted = 0
 
+                for i, page_url in enumerate(urls_to_fetch, 1):
+                    try:
+                        members = await self.extract(page_url, _skip_pagination_check=True)
+                        pages_extracted += 1
+
+                        if not members:
+                            if self.verbose:
+                                print(f"Pagina {i}: Sin miembros encontrados")
+                            continue
+
+                        # Filtrar duplicados
+                        new_members = []
+                        for m in members:
+                            if m.email and m.email.lower() not in seen_emails:
+                                seen_emails.add(m.email.lower())
+                                new_members.append(m)
+                            elif not m.email:
+                                # Miembros sin email: verificar por nombre
+                                name_key = m.name.lower().strip()
+                                if name_key not in seen_emails:
+                                    seen_emails.add(name_key)
+                                    new_members.append(m)
+
+                        if self.verbose:
+                            print(f"Pagina {i}: {len(new_members)} nuevos miembros (de {len(members)} extraidos)")
+
+                        # Si no hay miembros nuevos en la pagina 2, la paginacion URL no funciona
+                        if not new_members and members and i == 2:
+                            if self.verbose:
+                                print(f"Paginacion URL no funciona (paginas identicas). Intentando JS-based...")
+                            url_pagination_failed = True
+                            all_members = []  # Reiniciar para extraer con JS
+                            break
+
+                        # Si no hay miembros nuevos en paginas posteriores, finalizamos
+                        if not new_members and members:
+                            if self.verbose:
+                                print(f"Pagina {i}: Contenido duplicado detectado. Finalizando.")
+                            break
+
+                        all_members.extend(new_members)
+
+                    except Exception as e:
+                        if self.verbose:
+                            print(f"Error en pagina {i}: {e}")
+                        continue
+
+                if not url_pagination_failed:
+                    if self.verbose:
+                        print(f"\nTotal: {len(all_members)} miembros unicos de {pages_extracted} pagina(s)")
+                    return all_members
+
+            # Sin paginacion URL o paginacion URL fallida, continuar con paginacion JS-based
+            if url_pagination_failed and page_urls:
+                # La paginacion URL existe pero no funciona via navegacion directa
+                # Intentar hacer CLICK en los links de paginacion (funciona en Finalsite CMS)
                 if self.verbose:
-                    print(f"\nTotal: {len(all_members)} miembros extraidos de {len(urls_to_fetch)} pagina(s)")
+                    print(f"Intentando paginacion via click en links...")
 
-                return all_members
+                # Re-cargar pagina inicial
+                result = await crawler.arun(url=url, config=initial_config)
+                if not result.success:
+                    raise RuntimeError(f"Error al recargar {url}: {result.error_message}")
 
-            # Sin paginacion URL, continuar con paginacion JS-based
+                # Detectar patrones de paginacion en los links
+                page_param = None
+                for pattern in ['const_page', 'page_no', 'page', 'p']:
+                    if f'{pattern}=' in result.html:
+                        page_param = pattern
+                        break
+
+                if page_param:
+                    # Extraer pagina 1 - siempre intentar regex primero
+                    content_type, _ = self._analyze_content_type(result.html, result.markdown or "")
+                    use_hybrid = content_type == "embedded"
+
+                    members = self._extract_from_html_patterns(result.html)
+
+                    # Si regex no encontro nada, usar LLM
+                    if not members:
+                        if self.verbose:
+                            print("Regex no encontro datos en pagina 1, usando LLM...")
+                        llm_config = CrawlerRunConfig(
+                            extraction_strategy=extraction_strategy,
+                            session_id=session_id,
+                            cache_mode=CacheMode.BYPASS,
+                            word_count_threshold=10,
+                            excluded_tags=["script", "style", "nav", "footer", "aside"]
+                        )
+                        llm_result = await crawler.arun(url=url, config=llm_config)
+                        members = self._parse_extracted_content(llm_result.extracted_content)
+
+                    all_members.extend(members)
+                    seen_emails = {m.email.lower() for m in members if m.email}
+
+                    if self.verbose:
+                        print(f"Pagina 1: {len(members)} miembros")
+
+                    # Click en cada pagina siguiente
+                    for page_num in range(2, len(page_urls) + 1):
+                        if page_num > config.max_pages:
+                            break
+
+                        js_click_page = f"""
+                        (() => {{
+                            const links = document.querySelectorAll('a[href*="{page_param}={page_num}"]');
+                            if (links.length > 0) {{
+                                window.__lastContent = document.body.innerText.substring(0, 1000);
+                                links[0].click();
+                                return true;
+                            }}
+                            return false;
+                        }})();
+                        """
+
+                        js_wait_content = """
+                        js:() => {
+                            const current = document.body.innerText.substring(0, 1000);
+                            return current !== window.__lastContent;
+                        }
+                        """
+
+                        click_config = CrawlerRunConfig(
+                            session_id=session_id,
+                            js_code=js_click_page,
+                            wait_for=js_wait_content,
+                            js_only=True,
+                            cache_mode=CacheMode.BYPASS
+                        )
+
+                        if self.verbose:
+                            print(f"Pagina {page_num}: Click en link...")
+
+                        try:
+                            result = await crawler.arun(url=url, config=click_config)
+
+                            if not result.success:
+                                if self.verbose:
+                                    print(f"Error en pagina {page_num}")
+                                break
+
+                            # Siempre intentar regex primero (evita recargar pagina)
+                            members = self._extract_from_html_patterns(result.html)
+
+                            # Si regex no encontro nada, intentar LLM (pero esto recarga la pagina)
+                            if not members and not use_hybrid:
+                                if self.verbose:
+                                    print(f"  Regex no encontro datos, usando LLM...")
+                                llm_config = CrawlerRunConfig(
+                                    extraction_strategy=extraction_strategy,
+                                    session_id=session_id,
+                                    cache_mode=CacheMode.BYPASS,
+                                    word_count_threshold=10
+                                )
+                                llm_result = await crawler.arun(url=url, config=llm_config)
+                                members = self._parse_extracted_content(llm_result.extracted_content)
+
+                            # Filtrar duplicados
+                            new_members = [m for m in members if m.email and m.email.lower() not in seen_emails]
+
+                            if not new_members and members:
+                                if self.verbose:
+                                    print(f"Pagina {page_num}: Sin miembros nuevos. Finalizando.")
+                                break
+
+                            for m in new_members:
+                                if m.email:
+                                    seen_emails.add(m.email.lower())
+                            all_members.extend(new_members)
+
+                            if self.verbose:
+                                print(f"Pagina {page_num}: {len(new_members)} nuevos miembros")
+
+                        except Exception as e:
+                            if self.verbose:
+                                print(f"Error en pagina {page_num}: {e}")
+                            break
+
+                    if self.verbose:
+                        print(f"\nTotal: {len(all_members)} miembros extraidos via click")
+                    return all_members
+
+            elif url_pagination_failed:
+                # Re-cargar pagina inicial para paginacion JS tradicional
+                if self.verbose:
+                    print(f"Recargando pagina inicial para paginacion JS...")
+                result = await crawler.arun(url=url, config=initial_config)
+                if not result.success:
+                    raise RuntimeError(f"Error al recargar {url}: {result.error_message}")
+
             # Analizar tipo de contenido para decidir estrategia
             content_type, email_count = self._analyze_content_type(result.html, result.markdown or "")
             use_hybrid = content_type == "embedded"

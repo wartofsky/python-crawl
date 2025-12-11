@@ -30,3 +30,6 @@ Thumbs.db
 
 # Playwright
 .playwright/
+
+# Test OpenIA
+test_openai.py
